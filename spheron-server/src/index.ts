@@ -23,12 +23,34 @@ import { SpheronSDK } from "@spheron/protocol-sdk";
 import pkg from 'fs-extra';
 const { readFile } = pkg;
 import dotenv from 'dotenv';
+import axios from 'axios';
 dotenv.config();
 
 // Environment variables for Spheron SDK
 const SPHERON_PRIVATE_KEY = process.env.SPHERON_PRIVATE_KEY;
 const SPHERON_NETWORK = process.env.SPHERON_NETWORK || "testnet";
 const DEFAULT_PROVIDER_PROXY_URL = process.env.PROVIDER_PROXY_URL || "https://provider-proxy.spheron.network";
+const YAML_API_URL = process.env.YAML_API_URL || "http://provider.cpu.gpufarm.xyz:32692/generate";
+
+// YAML parsing helper
+const parseYamlEnv = (yamlContent: string) => {
+  try {
+    const parsed = yamlContent.match(/env:\n([\s\S]*?)(?=\n\S|$)/);
+    if (!parsed) return {};
+    const envLines = parsed[1].split('\n');
+    const envVars: Record<string, string> = {};
+    envLines.forEach(line => {
+      const match = line.trim().match(/-\s*(.*?)\s*=\s*(.*)/);
+      if (match) {
+        envVars[match[1]] = match[2];
+      }
+    });
+    return envVars;
+  } catch (error) {
+    console.error('[Error] Failed to parse YAML env vars:', error);
+    return {};
+  }
+};
 
 // Initialize Spheron SDK
 let spheronSDK: SpheronSDK;
@@ -76,16 +98,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             operation: {
               type: "string",
-              enum: ["deploy_compute", "fetch_balance", "fetch_deployment_urls", "fetch_lease_id", "deploy_yaml"],
+              enum: ["deploy_compute", "fetch_balance", "fetch_deployment_urls", "fetch_lease_id"],
               description: "The operation to perform"
+            },
+            request: {
+              type: "string",
+              description: "Natural language request for deployment"
             },
             yaml_content: {
               type: "string",
-              description: "YAML content for deployment (for deploy operations)"
+              description: "YAML content for deployment"
             },
             yaml_path: {
               type: "string",
-              description: "Path to YAML file (alternative to yaml_content)"
+              description: "Path to YAML file"
             },
             token: {
               type: "string",
@@ -104,7 +130,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: "URL for the provider proxy server (defaults to environment variable)"
             }
           },
-          required: ["operation"]
+          required: ["operation"],
+          oneOf: [
+            {
+              required: ["request"],
+              not: {
+                anyOf: [
+                  { required: ["yaml_content"] },
+                  { required: ["yaml_path"] }
+                ]
+              }
+            },
+            {
+              required: ["yaml_content"],
+              not: {
+                anyOf: [
+                  { required: ["request"] },
+                  { required: ["yaml_path"] }
+                ]
+              }
+            },
+            {
+              required: ["yaml_path"],
+              not: {
+                anyOf: [
+                  { required: ["request"] },
+                  { required: ["yaml_content"] }
+                ]
+              }
+            }
+          ]
         }
       }
     ]
@@ -131,17 +186,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     console.error(`[API] Executing operation: ${operation}`);
     
     switch (operation) {
-      case "deploy_compute":
-      case "deploy_yaml": {
-        // Get YAML content either directly or from file
+      case "deploy_compute": {
+        // Get YAML content based on input type
         let yamlContent: string;
         
-        if (args.yaml_content) {
+        if (args.request) {
+          // Natural language request - must use YAML generation API
+          try {
+            console.error('[API] Processing natural language deployment request');
+            console.error('[API] Sending request to YAML generation API');
+            const response = await axios.post(
+              YAML_API_URL,
+              { request: args.request },
+              { headers: { "Content-Type": "application/json" } }
+            );
+            
+            if (!response.data?.yaml) {
+              console.error('[Error] Invalid API response:', response.data);
+              throw new Error("Invalid YAML response structure from generator API");
+            }
+            
+            yamlContent = response.data.yaml;
+            console.error('[API] Successfully generated YAML from natural language request');
+            console.error('[Debug] Generated YAML:', yamlContent);
+          } catch (error) {
+            throw new McpError(
+              ErrorCode.InternalError,
+              `YAML generation failed: ${error instanceof Error ? error.message : String(error)}`
+            );
+          }
+        } else if (args.yaml_content) {
+          // Direct YAML content
           yamlContent = args.yaml_content as string;
+          console.error('[API] Using provided YAML content for deployment');
         } else if (args.yaml_path) {
+          // YAML from file
           const yamlPath = args.yaml_path as string;
           try {
             yamlContent = await readFile(yamlPath, 'utf8');
+            console.error('[API] Using YAML content from file:', yamlPath);
           } catch (error) {
             throw new McpError(
               ErrorCode.InvalidParams,
@@ -151,7 +234,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } else {
           throw new McpError(
             ErrorCode.InvalidParams,
-            "Either yaml_content or yaml_path must be provided"
+            "Must provide either a natural language request, YAML content, or YAML file path"
           );
         }
 
@@ -166,13 +249,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           typeof value === 'bigint' ? value.toString() : value
         ));
 
+        const envVars = parseYamlEnv(yamlContent);
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
               success: true,
               leaseId: safeResult.leaseId,
-              message: `Deployment created successfully with lease ID: ${safeResult.leaseId}`
+              message: `Deployment created successfully with lease ID: ${safeResult.leaseId}`,
+              environment: envVars
             }, null, 2)
           }]
         };
@@ -193,9 +278,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const balance = await spheronSDK.escrow.getUserBalance(token, walletAddress);
 
         // Handle BigInt serialization
-        const safeBalance = JSON.parse(JSON.stringify(balance, (key, value) => 
-          typeof value === 'bigint' ? value.toString() : value
-        ));
+        // Convert from base units (1e6 for CST)
+        const decimals = 6;
+        const convertUnits = (value: string) => 
+          (BigInt(value) / BigInt(10 ** decimals)).toString() + '.' +
+          (BigInt(value) % BigInt(10 ** decimals)).toString().padStart(decimals, '0').replace(/0+$/, '');
 
         return {
           content: [{
@@ -203,9 +290,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: JSON.stringify({
               success: true,
               balance: {
-                lockedBalance: safeBalance.lockedBalance,
-                unlockedBalance: safeBalance.unlockedBalance,
-                token: safeBalance.token
+                lockedBalance: convertUnits(balance.lockedBalance.toString()),
+                unlockedBalance: convertUnits(balance.unlockedBalance.toString()),
+                token: balance.token
               }
             }, null, 2)
           }]
